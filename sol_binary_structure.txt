@@ -1,0 +1,121 @@
+**Here is a precise table of the binary structure of a Solana DataShred** that contains a Pump.fun transaction (e.g. a `buy_v2`).
+
+Solana DataShreds are fixed-size packets (~1228 bytes) optimized for UDP/MTU. The Pump.fun payload (24 bytes) lives deep inside the serialized entries/transactions.
+
+### DataShred Overall Binary Layout (current versions)
+
+| Offset (from start of shred) | Size     | Field                          | Description / Notes |
+|------------------------------|----------|--------------------------------|---------------------|
+| 0x00 – 0x3F                 | 64 B     | Leader Signature               | Ed25519 signature (or Merkle root in v3) |
+| 0x40                         | 1 B      | Variant                        | Shred type + auth scheme (data shred range) |
+| 0x41 – 0x48                 | 8 B      | Slot                           | u64 little-endian |
+| 0x49 – 0x4C                 | 4 B      | Shred Index                    | u32 LE (position in FEC set) |
+| 0x4D – 0x4E                 | 2 B      | Version                        | u16 LE |
+| 0x4F – 0x52                 | 4 B      | FEC Set Index                  | u32 LE |
+| 0x53 – ~0x57                | ~5 B     | Data-specific header (v1/v2)   | Parent offset (u16), flags, size, etc. |
+| ~0x58+                       | up to ~1003–1100 B | **Payload** (Entry Batch)     | **This is where the Pump.fun data lives** |
+
+(The exact payload start can shift slightly with Merkle proofs in newer auth schemes — parsers usually skip the known header size.)
+
+### Inside the Payload → Entry Batch
+- **u64** (or compact) = Number of Entries in this batch
+- Then concatenated **serialized Entries**
+
+### Inside one Entry
+| Field                  | Size / Type          | Notes |
+|------------------------|----------------------|-------|
+| num_hashes             | u64                  | Usually 1 |
+| hashes                 | 32 B each            | PoH proof |
+| num_transactions       | CompactU16           | — |
+| Transactions           | Variable             | List of serialized txs (including your Pump.fun one) |
+
+### Inside one Transaction (Versioned v0, most common)
+| Field                        | Size / Type              | Notes |
+|------------------------------|--------------------------|-------|
+| Version marker               | 1 B (0x80 \| version)    | — |
+| Signatures                   | CompactU16 + 64 B each   | Usually 1 signature |
+| Message header               | 3 B                      | (req_sigs, readonly_signed, readonly_unsigned) |
+| Account keys                 | CompactU16 + 32 B each   | Pump program is one key |
+| Recent blockhash             | 32 B                     | — |
+| Instructions                 | CompactU16 + list        | **Pump buy_v2 instruction here** |
+| (Optional LUTs)              | —                        | — |
+
+### Inside the Pump.fun `buy_v2` CompiledInstruction
+| Field                    | Size / Type      | Content |
+|--------------------------|------------------|---------|
+| program_id_index         | 1 B              | Index of Pump program in account keys |
+| accounts                 | CompactU16 + u8s | Always **27** accounts (fixed order) |
+| data_length              | CompactU16       | Usually `0x18` (24) |
+| **data (payload)**       | **24 B**         | `b8 17 ee 61 67 c7 d3 3d` + u64 amount (LE) + u64 max_sol_cost (LE) |
+
+This is the exact spot where your Pump.fun buy payload appears in the raw binary stream of the shred.
+
+The structure is stable, but header details can have minor version differences (v1/v2/v3 Merkle). For production parsing, use libraries like the ones in orbitflare/shredstream-decode-example or Solana’s own `shred` crate.
+
+If you want:
+- A hex dump example of a full shred containing a Pump transaction, or
+- The same table focused only on the innermost instruction bytes, or
+- Code to parse a specific offset range,
+
+let me know!
+
+
+**Yes — the 27 accounts for `buy_v2` are always exactly the same.**
+
+Pump.fun made `buy_v2` (and `sell_v2`/`buy_exact_quote_in_v2`) deliberately **fixed and mandatory** so every transaction uses the identical account order and flags. This is explicitly stated in their official docs:
+
+> “All accounts are mandatory and are passed in the same order for all kinds of coins.”  
+> “No optional accounts — unified interface for both SOL-paired and non-SOL-paired coins.”
+
+### What this means in practice
+- The **order** of the 27 accounts **never changes**.
+- The **isWritable / isSigner** flags **never change**.
+- You always pass **all 27**, even if some are dummy/reused for SOL coins.
+
+Only the **actual Pubkey values** change per transaction (e.g. different mint, different bonding curve PDA, different user ATA, etc.).
+
+### The fixed 27-account list (in exact order you must provide)
+
+| #  | Account name                              | Usually mutable? | Signer? | Notes / How it changes |
+|----|-------------------------------------------|------------------|---------|------------------------|
+| 1  | global                                    | No               | No      | Always same PDA |
+| 2  | base_mint                                 | No               | No      | The token you're buying |
+| 3  | quote_mint                                | No               | No      | `So111...12` for SOL, or USDC/etc. later |
+| 4  | base_token_program                        | No               | No      | Usually Token-2022 for new coins |
+| 5  | quote_token_program                       | No               | No      | SPL Token or 2022 |
+| 6  | associated_token_program                  | No               | No      | Always `ATokenGPvbd...` |
+| 7  | fee_recipient                             | Yes              | No      | One of the 8 global fee recipients |
+| 8  | associated_quote_fee_recipient            | Yes              | No      | ATA of above |
+| 9  | buyback_fee_recipient                     | Yes              | No      | One of the 8 buyback recipients |
+| 10 | associated_quote_buyback_fee_recipient    | Yes              | No      | ATA of above |
+| 11 | bonding_curve                             | Yes              | No      | PDA `[bonding-curve, base_mint]` |
+| 12 | associated_base_bonding_curve             | Yes              | No      | ATA holding the token reserves |
+| 13 | associated_quote_bonding_curve            | Yes              | No      | ATA holding SOL/USDC reserves |
+| 14 | user                                      | Yes              | **Yes** | Your wallet (signer) |
+| 15 | associated_base_user                      | Yes              | No      | Your ATA for the memecoin |
+| 16 | associated_quote_user                     | Yes              | No      | Your SOL/USDC ATA (or native SOL for SOL pairs) |
+| 17 | creator_vault                             | Yes              | No      | PDA for creator fee vault |
+| 18 | associated_creator_vault                  | Yes              | No      | ATA of above |
+| 19 | sharing_config                            | No               | No      | PDA `[sharing-config, base_mint]` |
+| 20 | global_volume_accumulator                 | No               | No      | Global volume PDA |
+| 21 | user_volume_accumulator                   | Yes              | No      | PDA `[user_volume_accumulator, user]` |
+| 22 | associated_user_volume_accumulator        | Yes              | No      | ATA of above |
+| 23 | fee_config                                | No               | No      | Fees PDA |
+| 24 | fee_program                               | No               | No      | Pump fees program |
+| 25 | system_program                            | No               | No      | Always `1111...` |
+| 26 | event_authority                           | No               | No      | Pump event PDA |
+| 27 | program                                   | No               | No      | The pump program itself (`6EF8rrect...`) |
+
+### Why they did this
+It makes bot writing, MEV searching, and parsing **much more reliable** — you can hard-code the account order and just swap in the correct PDAs/ATAs for each coin.
+
+**Legacy `buy`** (the old one) had fewer accounts (~14–16) and some were optional. That’s why most new bots now use `buy_v2`.
+
+---
+
+Want me to give you:
+- The exact Rust/JS array of `AccountMeta` objects you can copy-paste?
+- How to derive the variable PDAs quickly (bonding_curve, sharing_config, etc.)?
+- Or the same list for `sell_v2`?
+
+Just say the word and I’ll drop the ready-to-use code.
