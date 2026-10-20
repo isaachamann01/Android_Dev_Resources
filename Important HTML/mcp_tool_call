@@ -1,0 +1,240 @@
+import json
+import os
+from collections.abc import Sequence
+from typing import Any, TypedDict, cast
+
+import chainlit as cl
+import httpx2
+from dotenv import load_dotenv
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+from mcp.types import CallToolResult, TextContent, Tool
+from openai import AsyncOpenAI
+from openai.types.chat import (
+    ChatCompletionAssistantMessageParam,
+    ChatCompletionMessageParam,
+    ChatCompletionMessageToolCallParam,
+    ChatCompletionSystemMessageParam,
+    ChatCompletionToolMessageParam,
+    ChatCompletionToolParam,
+    ChatCompletionUserMessageParam,
+)
+
+load_dotenv()
+
+
+def require_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Set {name} in .env")
+    return value
+
+
+OPENAI_API_KEY = require_env("OPENAI_API_KEY")
+OM_TOKEN = require_env("OPENMETADATA_TOKEN")
+OM_URL = os.getenv("OPENMETADATA_URL", "http://localhost:8585").rstrip("/")
+
+client = AsyncOpenAI(
+    api_key=OPENAI_API_KEY,
+    base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+)
+
+MODEL = os.getenv("MODEL", "gpt-4o-mini")
+MCP_URL = f"{OM_URL}/mcp"
+MAX_TOOL_ROUNDS = 6
+
+SYSTEM_MESSAGE: ChatCompletionSystemMessageParam = {
+    "role": "system",
+    "content": (
+        "You are a helpful assistant with access to OpenMetadata, the "
+        "company's data catalog. Use the tools to look up tables, datasets, "
+        "lineage, glossaries, owners, and other metadata. Prefer tool results "
+        "over guessing. When you mention an entity, use its fully qualified name."
+    ),
+}
+
+
+class PendingToolCall(TypedDict):
+    id: str
+    name: str
+    arguments: str
+
+
+def mcp_result_text(result: CallToolResult) -> str:
+    parts: list[str] = []
+    for block in result.content:
+        if isinstance(block, TextContent):
+            parts.append(block.text)
+
+    text = "\n".join(parts)
+    if text:
+        return text
+    if result.structured_content is not None:
+        return json.dumps(result.structured_content, default=str)
+    return json.dumps(result.model_dump(), default=str)
+
+
+def to_openai_tools(tools: Sequence[Tool]) -> list[ChatCompletionToolParam]:
+    result: list[ChatCompletionToolParam] = []
+    for tool in tools:
+        result.append({
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description or "",
+                "parameters": tool.input_schema,
+            },
+        })
+    return result
+
+
+async def run_turn(
+    history: list[ChatCompletionMessageParam],
+    tools: list[ChatCompletionToolParam],
+    reply: cl.Message,
+    session: ClientSession,
+) -> str:
+    content = ""
+
+    for _ in range(MAX_TOOL_ROUNDS):
+        stream = await client.chat.completions.create(
+            model=MODEL,
+            messages=history,
+            tools=tools,
+            stream=True,
+        )
+
+        content = ""
+        pending: dict[int, PendingToolCall] = {}
+
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+
+            delta = chunk.choices[0].delta
+
+            if delta.content:
+                content += delta.content
+                await reply.stream_token(delta.content)
+
+            for part in delta.tool_calls or []:
+                call = pending.setdefault(
+                    part.index,
+                    PendingToolCall(id="", name="", arguments=""),
+                )
+                if part.id:
+                    call["id"] = part.id
+
+                function = part.function
+                if function is None:
+                    continue
+
+                name = function.name
+                if name:
+                    call["name"] += name
+
+                arguments = function.arguments
+                if arguments:
+                    call["arguments"] += arguments
+
+        if not pending:
+            return content
+
+        tool_calls: list[ChatCompletionMessageToolCallParam] = [
+            {
+                "id": call["id"],
+                "type": "function",
+                "function": {
+                    "name": call["name"],
+                    "arguments": call["arguments"] or "{}",
+                },
+            }
+            for call in pending.values()
+        ]
+
+        assistant_message: ChatCompletionAssistantMessageParam = {
+            "role": "assistant",
+            "content": content or None,
+            "tool_calls": tool_calls,
+        }
+        history.append(assistant_message)
+
+        for call in pending.values():
+            raw_args: Any = json.loads(call["arguments"] or "{}")
+            args: dict[str, Any] = raw_args if isinstance(raw_args, dict) else {}
+
+            async with cl.Step(name=call["name"], type="tool") as step:
+                step.input = json.dumps(args, default=str)
+                result = await session.call_tool(call["name"], args)
+                step.output = mcp_result_text(result)[:4000]
+
+            tool_message: ChatCompletionToolMessageParam = {
+                "role": "tool",
+                "tool_call_id": call["id"],
+                "content": mcp_result_text(result),
+            }
+            history.append(tool_message)
+
+    return content or "I hit the tool-call limit before finishing."
+
+
+@cl.on_chat_start
+async def on_chat_start() -> None:
+    cl.user_session.set("history", [SYSTEM_MESSAGE])
+    await cl.Message(
+        content=f"Hi! I'm running on `{MODEL}` with OpenMetadata tools."
+    ).send()
+
+
+@cl.on_message
+async def on_message(message: cl.Message) -> None:
+    history = cast(
+        list[ChatCompletionMessageParam],
+        cl.user_session.get("history") or [SYSTEM_MESSAGE],
+    )
+    cl.user_session.set("history", history)
+
+    user_message: ChatCompletionUserMessageParam = {
+        "role": "user",
+        "content": message.content,
+    }
+    history.append(user_message)
+
+    reply = cl.Message(content="")
+    answer = ""
+
+    try:
+        async with (
+            httpx2.AsyncClient(
+                headers={"Authorization": f"Bearer {OM_TOKEN}"},
+                timeout=60.0,
+            ) as http_client,
+            streamable_http_client(
+                MCP_URL, http_client=http_client
+            ) as (read_stream, write_stream),
+            ClientSession(read_stream, write_stream) as session,
+        ):
+            await session.initialize()
+            listed = await session.list_tools()
+            tools = to_openai_tools(listed.tools)
+            answer = await run_turn(history, tools, reply, session)
+
+    except Exception as exc:
+        await cl.Message(content=f"OpenMetadata MCP error: {exc}").send()
+        return
+
+    assistant_message: ChatCompletionAssistantMessageParam = {
+        "role": "assistant",
+        "content": answer,
+    }
+    history.append(assistant_message)
+    await reply.update()
+What changed for typing
+- TextContent narrowing: isinstance(block, TextContent) instead of getattr(block, "type", ...), so .text is valid.
+- OpenAI TypedDicts: ChatCompletionMessageParam, ChatCompletionToolParam, etc., instead of dict[str, Any] for messages and tools.
+- PendingToolCall: a TypedDict for the streaming tool-call accumulator.
+- tool.input_schema: this is the Python attribute in mcp 2.3. The JSON wire name is still inputSchema. If you're on mcp 1.x, use tool.inputSchema and result.structuredContent instead.
+- Step.input is a string: Chainlit types it as str, so the code uses json.dumps(args) rather than assigning a dict.
+- require_env: returns str, so you don't carry str | None into the API client.
+- Initialized locals: answer and content start as "", avoiding “possibly unbound” errors.
+The remaining Any uses are at the JSON boundary: parsed tool arguments and structured_content, which are genuinely dynamic. Everything else in the request/response path is typed.
