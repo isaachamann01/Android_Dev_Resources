@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""kill_port.py — kill whatever is listening on a port, /proc-only.
+Usage: python3 kill_port.py [port]   (default 8100)
+"""
+import os, sys, signal, glob
+
+def kill_port(port: int) -> list:
+    hx = f"{port:04X}"
+    # 1. collect LISTEN socket inodes on this port (v4 + v6)
+    inodes = set()
+    for f in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            for line in open(f).read().splitlines()[1:]:
+                c = line.split()
+                if c[1].endswith(":" + hx) and c[3] == "0A":   # 0A = LISTEN
+                    inodes.add(c[9])
+        except OSError:
+            pass
+    if not inodes:
+        return []
+
+    # 2. map inodes -> pids via each process's fds
+    pids = set()
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        for fd in glob.glob(f"/proc/{pid}/fd/*"):
+            try:
+                link = os.readlink(fd)
+            except OSError:
+                continue
+            if link.startswith("socket:[") and link[8:-1] in inodes:
+                pids.add(int(pid))
+
+    # 3. SIGKILL them
+    killed = []
+    for pid in sorted(pids):
+        try:
+            cmd = open(f"/proc/{pid}/cmdline").read().replace("\0", " ").strip()
+        except OSError:
+            cmd = "(unreadable)"
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed.append((pid, cmd))
+        except OSError:
+            pass
+    return killed
+
+if __name__ == "__main__":
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8100
+    victims = kill_port(port)
+    if not victims:
+        print(f"port {port}: nothing to kill")
+    for pid, cmd in victims:
+        print(f"killed PID {pid}: {cmd}")
