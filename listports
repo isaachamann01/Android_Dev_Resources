@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""whoholds.py — find what's listening on a port, using only /proc.
+Usage: python3 whoholds.py [port]   (no arg = checks both CDSW ports)
+"""
+import os, sys, glob
+
+def listeners(port):
+    hx = f"{port:04X}"
+    inodes = set()
+    for f in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            for line in open(f).read().splitlines()[1:]:
+                c = line.split()
+                if c[1].endswith(":" + hx) and c[3] == "0A":   # 0A = LISTEN
+                    inodes.add(c[9])
+        except OSError:
+            pass
+    return inodes
+
+def owners(inodes):
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        for fd in glob.glob(f"/proc/{pid}/fd/*"):
+            try:
+                link = os.readlink(fd)
+            except OSError:
+                continue
+            if link.startswith("socket:[") and link[8:-1] in inodes:
+                try:
+                    cmd = open(f"/proc/{pid}/cmdline").read().replace("\0", " ").strip()
+                except OSError:
+                    cmd = "(unreadable)"
+                yield pid, cmd
+
+def main():
+    ports = [int(a) for a in sys.argv[1:]] or \
+            [int(os.getenv("CDSW_APP_PORT", 8010)), int(os.getenv("CDSW_READONLY_PORT", 8090))]
+    for port in ports:
+        ino = listeners(port)
+        print(f"port {port}: " + ("nothing listening" if not ino else f"{len(ino)} listener(s)"))
+        for pid, cmd in owners(ino):
+            print(f"  PID {pid} -> {cmd}")
+
+if __name__ == "__main__":
+    main()
